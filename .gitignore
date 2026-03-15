@@ -1,0 +1,9 @@
+OCR/
+__pycache__/
+*.pyc
+
+output/
+output_*/
+
+input/*
+!input/.gitkeep
