@@ -1,116 +1,129 @@
-# General Document Parser
+# Scanned Document Extractor
 
-This repository now contains a single document parsing system built around:
+This repository is a practical OCR pipeline for scanned PDFs and document images.
 
-- native extraction for digital documents
-- OCR for scanned documents and images
-- multi-backend OCR using EasyOCR plus optional Surya
-- reading-order reconstruction and form-style field extraction
+It is built around four ideas:
 
-The old Detectron2, LayoutParser, PaddleOCR, and LayoutLM pipeline has been removed.
+- rasterize every PDF page at high resolution
+- normalize the page before OCR
+- use Tesseract for page structure and reading order
+- use Surya to repair the lines that Tesseract is most likely to get wrong
 
-## Supported Inputs
+The goal is not just to dump text, but to preserve the document's structure well enough to produce readable text, markdown, per-page JSON, page images, and layout overlays.
 
-- Images: `.png`, `.jpg`, `.jpeg`, `.tif`, `.tiff`, `.bmp`, `.webp`
-- PDFs: native text when available, OCR fallback when needed
-- DOCX: paragraphs and tables
-- DOC: converted through Microsoft Word automation on Windows if Word is installed
-- Text: `.txt`, `.md`
+## What It Supports
+
+- scanned PDFs
+- document images: `.png`, `.jpg`, `.jpeg`, `.tif`, `.tiff`, `.bmp`, `.webp`
+- plain text / markdown passthrough: `.txt`, `.md`
 
 ## Current Architecture
 
-| Layer | File | Purpose |
+| Layer | File | Role |
 |---|---|---|
-| Entry point | `main.py` | CLI and output writing |
-| Document loading | `document_loader.py` | Load images, PDFs, DOCX, DOC, TXT, MD |
-| OCR backends | `ocr_backends.py` | EasyOCR backend, optional Surya backend, OCR result merging |
-| Parsing | `document_parser.py` | Reading order, row grouping, field extraction, final text/markdown/json |
+| CLI | `main.py` | Processes a file or folder and writes one output folder per input file |
+| Loading | `document_loader.py` | Rasterizes PDFs and loads images / text inputs |
+| Preprocessing | `image_preprocessing.py` | Upscaling, denoising, contrast normalization, deskewing, binarization |
+| OCR | `ocr_backends.py` | Tesseract page OCR + optional Surya line refinement |
+| Reconstruction | `document_parser.py` | Block grouping, column ordering, paragraph rebuilding, markdown / JSON output |
 
 ## Setup
 
-### 1. Create and activate a virtual environment
+### 1. Create a virtual environment
 
-**Windows PowerShell**
 ```powershell
 python -m venv OCR
 OCR\Scripts\Activate.ps1
 ```
 
-**Linux / macOS**
-```bash
-python3 -m venv OCR
-source OCR/bin/activate
-```
-
 ### 2. Install PyTorch first
 
-**CPU**
-```bash
+CPU:
+
+```powershell
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 ```
 
-**CUDA 12.1**
-```bash
+CUDA 12.1:
+
+```powershell
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 ```
 
-### 3. Install project dependencies
+### 3. Install Python dependencies
 
-```bash
+```powershell
 pip install -r requirements.txt
 ```
 
-## First Run
+### 4. Install Tesseract OCR
 
-The first run may download OCR model weights used by:
+Windows with `winget`:
 
-- EasyOCR
-- Surya
+```powershell
+winget install -e --id tesseract-ocr.tesseract --accept-package-agreements --accept-source-agreements
+```
 
-After the first download, subsequent runs use the local cache.
+If `tesseract.exe` is not on `PATH`, pass it explicitly:
+
+```powershell
+python main.py --tesseract-cmd "C:\Program Files\Tesseract-OCR\tesseract.exe"
+```
 
 ## Usage
 
-```bash
-# default input/output
+Put files in `input/` and run:
+
+```powershell
 python main.py
-
-# image
-python main.py input/document.png --output output_final
-
-# PDF
-python main.py input/report.pdf --output parsed_pdf
-
-# DOCX
-python main.py input/letter.docx --output parsed_docx
-
-# EasyOCR only
-python main.py input/document.png --output output_easy --disable-surya
 ```
 
-## Outputs
+Or point it at a specific file:
 
-| File | Description |
-|---|---|
-| `document.txt` | Plain text extraction |
-| `document.md` | Markdown rendering of extracted fields/text |
-| `result.json` | Structured metadata, fields, lines, and page content |
-| `layout_detection.png` | OCR line overlay for raster inputs |
+```powershell
+python main.py "input\scan.pdf"
+```
+
+Useful flags:
+
+```powershell
+python main.py "input\scan.pdf" --max-pages 3
+python main.py "input\scan.pdf" --disable-surya
+python main.py "input\scan.pdf" --output output_run
+python main.py "input\scan.pdf" --pdf-scale 4.5
+```
+
+## Output Layout
+
+Each input file gets its own folder under `output/`:
+
+```text
+output/
+  some_document/
+    document.txt
+    document.md
+    result.json
+    pages/
+      page_001.png
+    overlays/
+      page_001_overlay.png
+```
 
 ## Notes
 
-- `--disable-surya` is useful when you want the faster, more stable EasyOCR-only path.
-- `.doc` support depends on Microsoft Word being installed on the machine.
-- OCR quality will still vary by scan quality, handwriting, blur, skew, and template complexity.
-- The parser is designed so stronger OCR backends or postprocessors can be added without changing the CLI.
+- `--disable-surya` keeps the pipeline much faster. Use it when you want structure-first OCR without line repair.
+- The first Surya run may download model weights.
+- PDFs are always rasterized in this version, which keeps the OCR path consistent for scanned documents.
+- The parser uses deterministic heuristics for columns, headings, lists, and simple table-like rows. It is practical, but not perfect.
 
-## File Map
+## Verified Locally
 
-```text
-main.py
-document_loader.py
-document_parser.py
-ocr_backends.py
-requirements.txt
-input/
-```
+The current pipeline was run against:
+
+- `input/Private_Car_Long_Term_Policy_Policy_Wording_new_01_fb033caacd.pdf`
+
+The strongest results on the sample came from:
+
+- PDF rasterization at `--pdf-scale 4.0`
+- Tesseract for page segmentation and reading order
+- optional Surya repair for suspicious lines

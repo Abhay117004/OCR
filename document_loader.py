@@ -4,10 +4,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
-import docx
 import numpy as np
-import pdfplumber
 import pypdfium2 as pdfium
+
+
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
+TEXT_SUFFIXES = {".txt", ".md"}
+SUPPORTED_SUFFIXES = IMAGE_SUFFIXES | TEXT_SUFFIXES | {".pdf"}
 
 
 @dataclass
@@ -23,123 +26,88 @@ class RasterDocument:
     metadata: dict
 
 
-def load_document(path: str | Path) -> NativeDocument | RasterDocument:
+def iter_input_files(path: str | Path) -> list[Path]:
+    path = Path(path)
+    if path.is_file():
+        if path.suffix.lower() not in SUPPORTED_SUFFIXES:
+            raise ValueError(f"Unsupported input file: {path}")
+        return [path]
+
+    if not path.exists():
+        raise FileNotFoundError(f"Input path not found: {path}")
+
+    if not path.is_dir():
+        raise ValueError(f"Input path must be a file or folder: {path}")
+
+    files = [
+        item
+        for item in sorted(path.iterdir())
+        if item.is_file() and item.suffix.lower() in SUPPORTED_SUFFIXES
+    ]
+    return files
+
+
+def load_document(
+    path: str | Path,
+    pdf_scale: float = 4.0,
+    max_pages: int | None = None,
+) -> NativeDocument | RasterDocument:
     path = Path(path)
     suffix = path.suffix.lower()
 
-    if suffix in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}:
-        image = cv2.imread(str(path))
-        if image is None:
+    if suffix in IMAGE_SUFFIXES:
+        image_bgr = cv2.imread(str(path))
+        if image_bgr is None:
             raise FileNotFoundError(f"Cannot read image: {path}")
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         return RasterDocument(
-            pages=[cv2.cvtColor(image, cv2.COLOR_BGR2RGB)],
-            metadata={"source_type": "image", "path": str(path)},
+            pages=[image_rgb],
+            metadata={
+                "source_type": "image",
+                "path": str(path),
+                "page_count": 1,
+                "original_width": int(image_rgb.shape[1]),
+                "original_height": int(image_rgb.shape[0]),
+            },
         )
 
     if suffix == ".pdf":
-        return _load_pdf(path)
+        return _load_pdf(path, pdf_scale=pdf_scale, max_pages=max_pages)
 
-    if suffix == ".docx":
-        return _load_docx(path)
-
-    if suffix == ".doc":
-        return _load_doc(path)
-
-    if suffix in {".txt", ".md"}:
+    if suffix in TEXT_SUFFIXES:
         text = path.read_text(encoding="utf-8")
         return NativeDocument(
             text=text,
-            pages=[{"page": 1, "blocks": [{"type": "paragraph", "text": text}]}],
-            metadata={"source_type": "text", "path": str(path)},
+            pages=[{"page": 1, "text": text}],
+            metadata={"source_type": "text", "path": str(path), "page_count": 1},
         )
 
     raise ValueError(
-        f"Unsupported file type: {suffix}. Supported: images, PDF, DOCX, TXT, MD."
+        f"Unsupported file type: {suffix}. Supported: PDF, images, TXT, MD."
     )
 
 
-def _load_pdf(path: Path) -> NativeDocument | RasterDocument:
-    pages: list[dict] = []
-    native_chunks: list[str] = []
-
-    with pdfplumber.open(str(path)) as pdf:
-        for page_index, page in enumerate(pdf.pages, start=1):
-            text = (page.extract_text() or "").strip()
-            words = page.extract_words() or []
-            pages.append({"page": page_index, "text": text, "words": words})
-            if text:
-                native_chunks.append(text)
-
-    if native_chunks:
-        return NativeDocument(
-            text="\n\n".join(native_chunks),
-            pages=pages,
-            metadata={"source_type": "pdf-native", "path": str(path)},
-        )
-
+def _load_pdf(
+    path: Path,
+    pdf_scale: float = 4.0,
+    max_pages: int | None = None,
+) -> RasterDocument:
     pdf_doc = pdfium.PdfDocument(str(path))
-    images: list[np.ndarray] = []
-    for page_index in range(len(pdf_doc)):
-        bitmap = pdf_doc[page_index].render(scale=2.0).to_pil()
-        images.append(np.array(bitmap.convert("RGB")))
+    page_total = len(pdf_doc)
+    if max_pages is not None:
+        page_total = min(page_total, max_pages)
+
+    pages: list[np.ndarray] = []
+    for page_index in range(page_total):
+        bitmap = pdf_doc[page_index].render(scale=pdf_scale).to_pil()
+        pages.append(np.array(bitmap.convert("RGB")))
 
     return RasterDocument(
-        pages=images,
-        metadata={"source_type": "pdf-raster", "path": str(path)},
+        pages=pages,
+        metadata={
+            "source_type": "pdf-raster",
+            "path": str(path),
+            "page_count": page_total,
+            "pdf_scale": pdf_scale,
+        },
     )
-
-
-def _load_docx(path: Path) -> NativeDocument:
-    document = docx.Document(str(path))
-    blocks: list[dict] = []
-    text_parts: list[str] = []
-
-    for paragraph in document.paragraphs:
-        text = paragraph.text.strip()
-        if not text:
-            continue
-        blocks.append({"type": "paragraph", "text": text})
-        text_parts.append(text)
-
-    for table in document.tables:
-        for row in table.rows:
-            cells = [cell.text.strip() for cell in row.cells]
-            cells = [cell for cell in cells if cell]
-            if not cells:
-                continue
-            text = " | ".join(cells)
-            blocks.append({"type": "table_row", "text": text, "cells": cells})
-            text_parts.append(text)
-
-    return NativeDocument(
-        text="\n".join(text_parts),
-        pages=[{"page": 1, "blocks": blocks}],
-        metadata={"source_type": "docx", "path": str(path)},
-    )
-
-
-def _load_doc(path: Path) -> NativeDocument:
-    try:
-        import tempfile
-        from win32com.client import Dispatch
-    except Exception as exc:
-        raise ValueError(
-            ".doc support requires Microsoft Word on Windows plus pywin32."
-        ) from exc
-
-    temp_dir = Path(tempfile.mkdtemp(prefix="ocr_doc_"))
-    docx_path = temp_dir / f"{path.stem}.docx"
-    word = None
-    document = None
-    try:
-        word = Dispatch("Word.Application")
-        word.Visible = False
-        document = word.Documents.Open(str(path.resolve()))
-        document.SaveAs(str(docx_path), FileFormat=16)
-    finally:
-        if document is not None:
-            document.Close(False)
-        if word is not None:
-            word.Quit()
-
-    return _load_docx(docx_path)
